@@ -6,6 +6,8 @@ import concurrent.futures
 import time
 import hashlib
 from collections import deque
+import json
+import csv
 
 # ANSI color codes
 RED = "\033[91m"
@@ -238,18 +240,72 @@ def download_in_parallel(base_url, session, targets, output_dir, max_workers):
 
     return success_list, failure_list
 
+def write_report(success_list, failure_list, report_format):
+    """
+    Writes a summary of successes/failures to a file in the specified format (csv or json).
+    File names:
+      - report.csv
+      - report.json
+    """
+    if not report_format:
+        return  # If no format provided, do nothing
+
+    report_format = report_format.lower().strip()
+    if report_format == "csv":
+        filename = "report.csv"
+        fieldnames = ["status", "group", "project"]
+        with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            # Write successes
+            for grp_name, prj_name in success_list:
+                writer.writerow({"status": "SUCCESS", "group": grp_name, "project": prj_name})
+            # Write failures
+            for grp_name, prj_data in failure_list:
+                writer.writerow({"status": "FAILURE", "group": grp_name, "project": prj_data["name"]})
+        print(f"{GREEN}Report saved as '{filename}' (CSV).{RESET}")
+    elif report_format == "json":
+        filename = "report.json"
+        results = []
+        for grp_name, prj_name in success_list:
+            results.append({"status": "SUCCESS", "group": grp_name, "project": prj_name})
+        for grp_name, prj_data in failure_list:
+            results.append({"status": "FAILURE", "group": grp_name, "project": prj_data["name"]})
+        with open(filename, "w", encoding="utf-8") as json_file:
+            json.dump(results, json_file, indent=2, ensure_ascii=False)
+        print(f"{GREEN}Report saved as '{filename}' (JSON).{RESET}")
+    else:
+        print(f"{YELLOW}Invalid report format '{report_format}'. No report generated.{RESET}")
+
 def main():
     parser = argparse.ArgumentParser(description="Download GitLab project archives with nested subgroups.")
-    parser.add_argument("--gitlab-url", default="https://gitlab.com", help="Base URL for GitLab, e.g. 'https://gitlab.example.com'. Default: 'https://gitlab.com'")
-    parser.add_argument("--token", required=False, help="Personal Access Token with 'api' scope (or equivalent).")
-    parser.add_argument("--output-dir", default="downloads", help="Directory to store downloaded archives (default: 'gitlab_archives').")
-    parser.add_argument("--max-workers", type=int, default=4, help="Number of parallel download threads (default: 4).")
+    parser.add_argument("--gitlab-url", default="https://gitlab.com", 
+                        help="Base URL for GitLab, e.g. 'https://gitlab.example.com'. Default: 'https://gitlab.com'")
+    parser.add_argument("--token", required=False, 
+                        help="Personal Access Token with 'api' scope (or equivalent).")
+    parser.add_argument("--output-dir", default="gitlab_archives", 
+                        help="Directory to store downloaded archives (default: 'gitlab_archives').")
+    parser.add_argument("--max-workers", type=int, default=4, 
+                        help="Number of parallel download threads (default: 4).")
+    # New Features:
+    parser.add_argument("--report-format", default="csv", 
+                        help="Generate final report in CSV or JSON (e.g. '--report-format csv' or '--report-format json').")
+    parser.add_argument("--cookie", default=None,
+                        help="Optional: custom cookie value to add to HTTP headers.")
+    parser.add_argument("--user-agent", default=None,
+                        help="Optional: custom User-Agent string to add to HTTP headers.")
     args = parser.parse_args()
 
-    # Basic validations for better UX
+    # Item #20: Automatic CLI Prompt for Missing Parameters
+    # Prompt for token if not provided
     if not args.token or not args.token.strip():
-        print(f"{RED}Error: --token cannot be empty or missing.{RESET}")
-        return
+        temp_token = input("Please enter your Personal Access Token (required): ").strip()
+        if not temp_token:
+            print(f"{RED}Error: Token cannot be empty.{RESET}")
+            return
+        args.token = temp_token
+
+    # Basic validations for better UX
     if not args.gitlab_url.startswith("http"):
         print(f"{RED}Error: --gitlab-url must start with 'http' or 'https'. You provided: {args.gitlab_url}{RESET}")
         return
@@ -260,6 +316,14 @@ def main():
         "Private-Token": args.token.strip(),
         "Connection": "keep-alive"
     })
+
+    # Item #11: Optional Custom HTTP Headers
+    # If user provides a custom cookie
+    if args.cookie:
+        session.headers.update({"Cookie": args.cookie})
+    # If user provides a custom User-Agent
+    if args.user_agent:
+        session.headers.update({"User-Agent": args.user_agent})
 
     # 1. Fetch all groups (including subgroups), building 'full_path' for nested folders
     try:
@@ -294,32 +358,20 @@ def main():
     attempt = 1
     while failures:
         print(f"\n{YELLOW}--- Retry Attempt {attempt} for {len(failures)} failures ---{RESET}")
-        # Convert (grp_name, project) back into the full format required by `download_in_parallel`.
-        # Because we no longer have the group_full_path in each failure tuple, we need to look it up again
-        # or embed it from the start. We'll embed it from the start by carrying it in the failure set.
-        
-        # Let's re-build the list in the correct form:
-        # To do this properly, we stored only (grp_name, prj_data) in the failures. We need the full path.
-        # A quick fix is to store that from the start (in the try block above).
-        
-        # But since we only have (grp_name, prj_data) in the failures list, let's do a trick:
-        # We'll store a mapping from (grp_name, prj_id) -> group_full_path from the original `all_targets`.
-        
-        # Build a dictionary for quick lookup:
+        # Rebuild targets in the correct form: (group_full_path, group_name, project)
+        # We must look up the 'full_path' again based on (grp_name, prj_id).
         path_lookup = {}
         for (full_path, g_name, prj) in all_targets:
             path_lookup[(g_name, prj['id'])] = full_path
-        
-        # Now we can reconstruct the targets for the next parallel call:
+
         failure_targets = []
         for (grp_name, prj_data) in failures:
             prj_id = prj_data['id']
             if (grp_name, prj_id) in path_lookup:
                 failure_targets.append((path_lookup[(grp_name, prj_id)], grp_name, prj_data))
             else:
-                # It's unusual if we do not find it, but in case not, skip.
                 print(f"{RED}Warning: Could not find path for failed project '{prj_data['name']}' in group '{grp_name}'{RESET}")
-        
+
         new_successes, new_failures = download_in_parallel(
             args.gitlab_url, session, failure_targets, args.output_dir, args.max_workers
         )
@@ -353,6 +405,9 @@ def main():
             print(f"  - {grp_name} :: {prj_data['name']}")
     else:
         print(f"{GREEN}All downloads succeeded.{RESET}")
+
+    # Generate a final report if requested (Item #9)
+    write_report(successes, failures, args.report_format)
 
 if __name__ == "__main__":
     main()
